@@ -1,0 +1,5 @@
+streamlit
+requests
+PyPDF2
+scikit-learn
+numpy
