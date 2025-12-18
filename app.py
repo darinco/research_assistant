@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import io
+import re
 import numpy as np
 from PyPDF2 import PdfReader
 from sklearn.metrics.pairwise import cosine_similarity
@@ -22,7 +23,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🧠 DeepResearch Agent")
-st.caption("Powered by Exa (Search) & Fireworks (Inference)")
+st.caption("Powered by Exa (Search) & Fireworks (Inference) + Unpaywall")
 
 # --- SIDEBAR & SETTINGS ---
 with st.sidebar:
@@ -38,12 +39,15 @@ with st.sidebar:
         fw_key = st.secrets["FIREWORKS_API_KEY"]
     else:
         fw_key = st.text_input("Fireworks API Key", type="password")
+
+    st.divider()
+    email_unpaywall = st.text_input("Email for Unpaywall", value="your_email@example.com", help="Needed to access the Unpaywall API")
     
     st.divider()
     
     st.subheader("Search Parameters")
     num_results = st.slider("Articles to analyze", 3, 10, 4)
-    year_range = st.slider("Publication Year", 2015, 2025, (2023, 2025))
+    year_range = st.slider("Publication Year", 2015, 2030, (2023, 2025))
     start_year, end_year = year_range
 
 # --- SESSION STATE (Chat History) ---
@@ -64,15 +68,50 @@ def get_embedding(text, api_key):
     except:
         return np.zeros(768)
 
-def process_pdf(paper):
+def extract_doi(url):
+    doi_pattern = r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)'
+    match = re.search(doi_pattern, url, re.IGNORECASE)
+    return match.group(1) if match else None
+
+def check_unpaywall(doi, email):
+    if not doi: return None
+    url = f"https://api.unpaywall.org/v2/{doi}?email={email}"
     try:
-        r = requests.get(paper["url"], timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('is_oa') and data.get('best_oa_location'):
+                return data['best_oa_location'].get('url_for_pdf')
+    except:
+        pass
+    return None
+
+def process_pdf(paper):
+    target_url = paper["url"]
+    original_source = "Exa"
+    
+    doi = extract_doi(target_url)
+    if doi:
+        oa_url = check_unpaywall(doi, email_unpaywall)
+        if oa_url:
+            target_url = oa_url
+            original_source = "Unpaywall (Open Access) 🔓"
+
+    try:
+        r = requests.get(target_url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (ResearchBot/1.0)"})
         if r.status_code == 200:
             pdf = PdfReader(io.BytesIO(r.content))
             texts = [p.extract_text() for p in pdf.pages if p.extract_text()]
             full_text = " ".join(texts)
+            
             if len(full_text) > 500:
-                return {"title": paper.get("title"), "url": paper["url"], "text": full_text[:20000]}
+                return {
+                    "title": paper.get("title"), 
+                    "url": target_url, 
+                    "original_url": paper["url"], 
+                    "source_type": original_source,
+                    "text": full_text[:20000]
+                }
     except:
         return None
     return None
@@ -130,8 +169,7 @@ if query := st.chat_input("For example: LLM optimization methods 2024"):
                 "query": query, "category": "papers", "type": "fast", 
                 "numResults": num_results,
                 "startPublishedDate": f"{start_year}-01-01",
-                "endPublishedDate": f"{end_year}-12-31",
-                "filters": {"filetype": "pdf"}
+                "endPublishedDate": f"{end_year}-12-31"
             }
             try:
                 resp = requests.post(exa_url, json=payload, headers={"Authorization": f"Bearer {exa_key}"})
@@ -143,19 +181,21 @@ if query := st.chat_input("For example: LLM optimization methods 2024"):
                 st.stop()
 
             # --- STEP 2: Download ---
-            status.write("📥 Downloading and reading PDF...")
+            status.write("🔓 Checking Unpaywall and downloading...")
             docs = []
             with ThreadPoolExecutor(max_workers=5) as executor:
                 results = list(executor.map(process_pdf, papers))
                 docs = [d for d in results if d is not None]
             
             if not docs:
-                status.update(label="Failed to download PDF", state="error")
-                st.error("Could not read PDF. They might be locked.")
+                st.error("Failed to read the articles.")
                 st.stop()
+            
+            unpaywall_count = sum(1 for d in docs if "Unpaywall" in d["source_type"])
+            status.write(f"📥 Successfully downloaded: {len(docs)} ({unpaywall_count} via Unpaywall)")
 
-            # --- STEP 3: Rank ---
-            status.write("🧠 Analyzing relevance...")
+            # 3. Rank
+            status.write("🧠 Analysis relevance...")
             q_emb = get_embedding(query, fw_key)
             valid_docs = []
             for d in docs:
@@ -171,8 +211,8 @@ if query := st.chat_input("For example: LLM optimization methods 2024"):
             else:
                 top_docs = docs[:2]
 
-            # --- STEP 4: Summarize ---
-            status.write("📝 Summarizing...")
+            # 4. Summarize
+            status.write("📝 Report generation...")
             with ThreadPoolExecutor(max_workers=2) as executor:
                 future_to_doc = {executor.submit(generate_summary, doc, fw_key): doc for doc in top_docs}
                 for future in future_to_doc:
@@ -181,14 +221,13 @@ if query := st.chat_input("For example: LLM optimization methods 2024"):
 
             status.update(label="Готово!", state="complete", expanded=False)
 
-        # --- DISPLAY FINAL RESULT ---
-        final_md = "### 🏁 Research results\n\n"
-        
+        # --- OUTPUT ---
+        final_md = "### 🏁 Outcomes\n\n"
         for d in top_docs:
-            final_md += f"#### 📄 [{d['title']}]({d['url']})\n"
+            source_badge = "🟢 Open Access" if "Unpaywall" in d['source_type'] else "🔵 Web PDF"
+            final_md += f"#### {d['title']}\n"
+            final_md += f"**Source:** [{source_badge}]({d['url']}) | **Original:** [Ссылка]({d['original_url']})\n\n"
             final_md += f"{d['summary']}\n\n---\n"
         
         st.markdown(final_md)
-        
-        # Save to history
         st.session_state.messages.append({"role": "assistant", "content": final_md})
